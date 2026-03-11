@@ -21,6 +21,10 @@ signal run_enter_requested
 signal run_reward_selected(index: int)
 signal card_play_requested(index: int)
 signal card_draft_pick_requested(index: int)
+signal base_card_hovered(profile_id: String)
+signal rhythm_preset_requested(preset_id: String)
+signal master_volume_changed(volume_linear: float)
+signal master_mute_toggled(muted: bool)
 
 const SCREEN_HOME: String = "home"
 const SCREEN_RUN: String = "run"
@@ -32,18 +36,24 @@ var _score_label: Label
 var _battle_label: Label
 var _variation_label: Label
 var _interaction_label: Label
+var _volume_value_label: Label
 
 var _run_status_label: Label
 var _run_node_label: Label
+var _run_combat_hint_label: Label
 var _card_passive_label: Label
+var _run_base_label: Label
+var _enemy_placeholder_panel: PanelContainer
+var _enemy_face_label: Label
+var _enemy_objective_label: Label
 
 var _track_selector: OptionButton
 var _boss_selector: OptionButton
-var _run_choice_selector: OptionButton
 
 var _step_container: HBoxContainer
 var _layer_rows: VBoxContainer
 var _upgrade_rows: VBoxContainer
+var _run_choice_cards: HFlowContainer
 
 var _bpm_spinbox: SpinBox
 var _auto_variation_check: CheckBox
@@ -62,11 +72,15 @@ var _upgrade_boxes: Dictionary = {}
 
 var _selected_track: String = ""
 var _suppress_step_events: bool = false
-var _suppress_run_choice_events: bool = false
 
 var _nav_buttons: Dictionary = {}
 var _screens: Dictionary = {}
 var _current_screen: String = SCREEN_HOME
+var _studio_unlocked: bool = false
+var _current_run_choices: Array = []
+var _master_volume_slider: HSlider
+var _master_mute_box: CheckBox
+var _suppress_volume_events: bool = false
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -119,45 +133,73 @@ func update_battle_display(result: Dictionary) -> void:
 func update_variation_display(text: String) -> void:
 	_variation_label.text = "Estado: %s" % text
 
+func update_run_combat_hint(text: String) -> void:
+	if _run_combat_hint_label == null:
+		return
+	_run_combat_hint_label.text = "Pelea: %s" % text
+
 func update_run_status(run_state: Dictionary) -> void:
 	var active: bool = bool(run_state.get("active", false))
 	if not active:
 		_run_status_label.text = "Run inactiva (pulsa New Run)"
 		_run_node_label.text = "Nodo seleccionado: -"
+		update_run_combat_hint("Sin run activa.")
+		_run_base_label.text = "Base activa: ninguna"
+		_update_enemy_placeholder({})
+		set_studio_unlocked(false)
 		_run_enter_button.disabled = true
 		return
 
 	var hp: int = int(run_state.get("hp", 0))
 	var max_hp: int = int(run_state.get("max_hp", 0))
 	var coins: int = int(run_state.get("coins", 0))
+	var base_profile_id: String = String(run_state.get("base_profile_id", ""))
 	var phase: int = int(run_state.get("phase", 1))
 	var phase_step: int = int(run_state.get("phase_step", 1))
 	var floor: int = int(run_state.get("floor", 0))
 	var floors_total: int = int(run_state.get("floors_total", 0))
 	var awaiting_reward: bool = bool(run_state.get("awaiting_reward", false))
+	var has_base: bool = not base_profile_id.is_empty()
+	var streak: int = int(run_state.get("streak", 0))
+	var battles_won: int = int(run_state.get("battles_won", 0))
+	var visited_count: int = 0
+	var visited_variant: Variant = run_state.get("visited_nodes", [])
+	if typeof(visited_variant) == TYPE_ARRAY:
+		var visited_nodes: Array = visited_variant as Array
+		visited_count = visited_nodes.size()
 
-	_run_status_label.text = "Run HP %d/%d | Coins %d | Fase %d-%d | Piso %d/%d | %s" % [
-		hp, max_hp, coins, phase, phase_step, floor, floors_total, "Elige recompensa" if awaiting_reward else "Elige nodo"
+	_run_status_label.text = "Run HP %d/%d | Coins %d | Streak %d | Wins %d | Ruta %d | Fase %d-%d | Piso %d/%d | %s" % [
+		hp, max_hp, coins, streak, battles_won, visited_count, phase, phase_step, floor, floors_total, "Elige recompensa" if awaiting_reward else "Elige nodo"
 	]
+	_run_base_label.text = "Base activa: %s" % (_pretty_base_name(base_profile_id) if has_base else "ninguna (elige carta)")
+	set_studio_unlocked(has_base)
 	_run_enter_button.disabled = awaiting_reward
+	if not has_base:
+		_interaction_label.text = "Interaccion: Paso 1 -> elige carta base (hover para escuchar)"
+	elif awaiting_reward:
+		_interaction_label.text = "Interaccion: Paso actual -> elige recompensa"
+	else:
+		_interaction_label.text = "Interaccion: Click en una carta para avanzar"
 
 func update_run_choices(choices: Array, selected_index: int, pending_node: Dictionary) -> void:
-	_suppress_run_choice_events = true
-	_run_choice_selector.clear()
+	_current_run_choices = []
+	for choice in choices:
+		if typeof(choice) == TYPE_DICTIONARY:
+			_current_run_choices.append((choice as Dictionary).duplicate(true))
+
+	for child in _run_choice_cards.get_children():
+		child.queue_free()
+
 	for i in range(choices.size()):
 		var item: Dictionary = choices[i]
-		var subtitle: String = String(item.get("subtitle", ""))
-		var label: String = String(item.get("label", "Nodo"))
-		if subtitle.is_empty():
-			_run_choice_selector.add_item("%d) %s" % [i + 1, label])
-		else:
-			_run_choice_selector.add_item("%d) %s - %s" % [i + 1, label, subtitle])
-	if selected_index >= 0 and selected_index < _run_choice_selector.get_item_count():
-		_run_choice_selector.select(selected_index)
-	_suppress_run_choice_events = false
+		var card_button: Button = _create_choice_card_button(item, i, i == selected_index)
+		card_button.pressed.connect(_on_run_choice_card_pressed.bind(i))
+		card_button.mouse_entered.connect(_on_run_choice_card_hovered.bind(i))
+		_run_choice_cards.add_child(card_button)
 
 	if pending_node.is_empty():
 		_run_node_label.text = "Nodo seleccionado: -"
+		_update_enemy_placeholder({})
 	else:
 		var pending_label: String = String(pending_node.get("label", "-"))
 		var pending_subtitle: String = String(pending_node.get("subtitle", ""))
@@ -165,6 +207,17 @@ func update_run_choices(choices: Array, selected_index: int, pending_node: Dicti
 			pending_label,
 			" | %s" % pending_subtitle if not pending_subtitle.is_empty() else ""
 		]
+		_update_enemy_placeholder(pending_node)
+
+	var pending_type: String = String(pending_node.get("type", ""))
+	if pending_type == "first_enemy":
+		_interaction_label.text = "Interaccion: Siguiente -> enfrenta al primer enemigo"
+	elif pending_type == "miniboss":
+		_interaction_label.text = "Interaccion: Miniboss final del acto"
+	elif pending_type == "combat" or pending_type == "elite" or pending_type == "boss":
+		_interaction_label.text = "Interaccion: combate musical"
+	elif pending_type == "base_seed":
+		_interaction_label.text = "Interaccion: Hover carta para escuchar, click para elegir base"
 
 func show_reward_choices(rewards: Array, coins: int) -> void:
 	for child in _reward_row.get_children():
@@ -178,11 +231,14 @@ func show_reward_choices(rewards: Array, coins: int) -> void:
 		var reward: Dictionary = rewards[i]
 		var cost: int = int(reward.get("cost", 0))
 		var button: Button = Button.new()
-		button.custom_minimum_size = Vector2(220, 40)
-		button.text = "%s%s" % [
+		button.custom_minimum_size = Vector2(220, 90)
+		button.text = "%s\n%s" % [
 			String(reward.get("label", "Reward")),
-			" (cost %d)" % cost if cost > 0 else ""
+			"Cost %d coins" % cost if cost > 0 else "Gratis"
 		]
+		button.add_theme_font_size_override("font_size", 14)
+		button.add_theme_stylebox_override("normal", _card_style(Color(0.11, 0.16, 0.22, 0.96), Color(0.30, 0.39, 0.54)))
+		button.add_theme_stylebox_override("hover", _card_style(Color(0.15, 0.22, 0.30, 0.98), Color(0.50, 0.64, 0.83)))
 		button.disabled = cost > coins
 		button.pressed.connect(_on_run_reward_button_pressed.bind(i))
 		_reward_row.add_child(button)
@@ -231,6 +287,14 @@ func set_track_pattern(track_name: String, pattern: Array) -> void:
 		_step_buttons[i].button_pressed = int(pattern[i]) == 1
 	_suppress_step_events = false
 
+func select_track(track_name: String) -> void:
+	var index: int = _track_order.find(track_name)
+	if index < 0:
+		return
+	_selected_track = track_name
+	if _track_selector != null:
+		_track_selector.select(index)
+
 func set_layer_state(layer_id: String, is_active: bool, is_muted: bool) -> void:
 	if _layer_active_boxes.has(layer_id):
 		(_layer_active_boxes[layer_id] as CheckBox).set_pressed_no_signal(is_active)
@@ -247,6 +311,146 @@ func highlight_step(step_index: int) -> void:
 		button.modulate = Color(1.0, 1.0, 1.0)
 		if i == step_index:
 			button.modulate = Color(0.82, 1.0, 0.72)
+
+func set_studio_unlocked(unlocked: bool) -> void:
+	_studio_unlocked = unlocked
+	if _nav_buttons.has(SCREEN_STUDIO):
+		var studio_button: Button = _nav_buttons[SCREEN_STUDIO]
+		studio_button.visible = unlocked
+		studio_button.disabled = not unlocked
+	if not unlocked and _current_screen == SCREEN_STUDIO:
+		_switch_screen(SCREEN_RUN)
+
+func set_master_volume(volume_linear: float, muted: bool) -> void:
+	_suppress_volume_events = true
+	var volume_clamped: float = clamp(volume_linear, 0.0, 1.0)
+	if _master_volume_slider != null:
+		_master_volume_slider.value = volume_clamped
+	if _master_mute_box != null:
+		_master_mute_box.set_pressed_no_signal(muted)
+	if _volume_value_label != null:
+		_volume_value_label.text = "%d%%" % int(round(volume_clamped * 100.0))
+	_suppress_volume_events = false
+
+func _pretty_base_name(base_profile_id: String) -> String:
+	match base_profile_id:
+		"drum_seed":
+			return "Drum Pulse"
+		"trumpet_seed":
+			return "Brass Call"
+		"bass_seed":
+			return "Bass March"
+		_:
+			return base_profile_id
+
+func _create_choice_card_button(item: Dictionary, index: int, selected: bool) -> Button:
+	var node_type: String = String(item.get("type", "node"))
+	var title: String = String(item.get("label", "Node"))
+	var subtitle: String = String(item.get("subtitle", ""))
+	var objective: String = String(item.get("objective", ""))
+	var score_text: String = ""
+	if item.has("required_score"):
+		score_text = "Req score: %d" % int(item.get("required_score", 0))
+
+	var helper: String = "Click para avanzar"
+	if node_type == "base_seed":
+		helper = "Hover para escuchar | Click para elegir"
+	elif node_type == "first_enemy":
+		helper = "Click para enfrentar enemigo"
+	elif node_type == "miniboss":
+		helper = "Click para duelo final del acto"
+	elif node_type == "combat" or node_type == "elite" or node_type == "boss":
+		helper = "Click para combatir"
+
+	var lines: Array[String] = []
+	lines.append("Carta %d" % (index + 1))
+	lines.append(title)
+	if not subtitle.is_empty():
+		lines.append(subtitle)
+	if not objective.is_empty():
+		lines.append(objective)
+	if not score_text.is_empty():
+		lines.append(score_text)
+	lines.append(helper)
+
+	var text: String = ""
+	for i in range(lines.size()):
+		if i > 0:
+			text += "\n"
+		text += lines[i]
+
+	var button: Button = Button.new()
+	button.custom_minimum_size = Vector2(220, 170)
+	button.text = text
+	button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	button.add_theme_font_size_override("font_size", 15)
+	var accent: Color = _node_accent(node_type)
+	button.add_theme_stylebox_override("normal", _card_style(Color(0.11, 0.16, 0.23, 0.96), accent * 0.65))
+	button.add_theme_stylebox_override("hover", _card_style(Color(0.16, 0.22, 0.30, 0.98), accent))
+	button.add_theme_stylebox_override("pressed", _card_style(Color(0.18, 0.25, 0.34, 0.98), Color(0.90, 0.94, 1.0)))
+	if selected:
+		button.modulate = Color(1.0, 1.0, 0.86)
+	return button
+
+func _node_accent(node_type: String) -> Color:
+	match node_type:
+		"base_seed":
+			return Color(0.60, 0.78, 0.98)
+		"first_enemy":
+			return Color(0.98, 0.58, 0.52)
+		"miniboss":
+			return Color(0.98, 0.32, 0.32)
+		"combat":
+			return Color(0.96, 0.63, 0.48)
+		"elite":
+			return Color(0.97, 0.52, 0.52)
+		"boss":
+			return Color(0.95, 0.40, 0.40)
+		"rest":
+			return Color(0.58, 0.90, 0.67)
+		"shop":
+			return Color(0.92, 0.84, 0.55)
+		"event":
+			return Color(0.75, 0.72, 0.95)
+		_:
+			return Color(0.52, 0.66, 0.84)
+
+func _update_enemy_placeholder(node: Dictionary) -> void:
+	if _enemy_placeholder_panel == null:
+		return
+	if node.is_empty():
+		_enemy_placeholder_panel.visible = false
+		return
+
+	var node_type: String = String(node.get("type", ""))
+	var is_battle: bool = node_type == "first_enemy" or node_type == "combat" or node_type == "elite" or node_type == "miniboss" or node_type == "boss"
+	_enemy_placeholder_panel.visible = is_battle
+	if not is_battle:
+		return
+
+	var enemy_name: String = String(node.get("enemy_name", node.get("label", "Enemy")))
+	var face: String = String(node.get("enemy_visual", "( o_o )"))
+	var objective: String = String(node.get("objective", "Derrota al enemigo cumpliendo el objetivo musical."))
+	_enemy_face_label.text = "%s\n%s" % [face, enemy_name]
+	_enemy_objective_label.text = objective
+
+func _card_style(fill: Color, border: Color) -> StyleBoxFlat:
+	var style: StyleBoxFlat = StyleBoxFlat.new()
+	style.bg_color = fill
+	style.border_color = border
+	style.border_width_left = 2
+	style.border_width_top = 2
+	style.border_width_right = 2
+	style.border_width_bottom = 2
+	style.corner_radius_top_left = 10
+	style.corner_radius_top_right = 10
+	style.corner_radius_bottom_left = 10
+	style.corner_radius_bottom_right = 10
+	style.content_margin_left = 10
+	style.content_margin_top = 10
+	style.content_margin_right = 10
+	style.content_margin_bottom = 10
+	return style
 
 func _build_ui() -> void:
 	for child in get_children():
@@ -301,7 +505,7 @@ func _build_header() -> Control:
 	col.add_child(title)
 
 	var subtitle: Label = Label.new()
-	subtitle.text = "Loop de run: X-1 base, X-2 nodo, X-3 boss. Build musical por capas."
+	subtitle.text = "Fase 1 piloto: elige 1 instrumento base y completa un mini-acto con decisiones y miniboss."
 	subtitle.modulate = Color(0.70, 0.82, 0.90)
 	subtitle.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(subtitle)
@@ -315,6 +519,7 @@ func _build_header() -> Control:
 	nav.add_child(_create_nav_button("RUN", SCREEN_RUN))
 	nav.add_child(_create_nav_button("STUDIO", SCREEN_STUDIO))
 	nav.add_child(_create_nav_button("BATTLE", SCREEN_BATTLE))
+	set_studio_unlocked(_studio_unlocked)
 
 	return panel
 
@@ -395,6 +600,45 @@ func _build_hud() -> Control:
 	_interaction_label.modulate = Color(0.86, 0.92, 0.74)
 	row.add_child(_interaction_label)
 
+	var volume_row: HBoxContainer = HBoxContainer.new()
+	volume_row.add_theme_constant_override("separation", 6)
+	row.add_child(volume_row)
+
+	var volume_label: Label = Label.new()
+	volume_label.text = "Volumen"
+	volume_row.add_child(volume_label)
+
+	var volume_minus: Button = Button.new()
+	volume_minus.text = "-"
+	volume_minus.custom_minimum_size = Vector2(28, 24)
+	volume_minus.pressed.connect(_on_master_volume_minus_pressed)
+	volume_row.add_child(volume_minus)
+
+	_master_volume_slider = HSlider.new()
+	_master_volume_slider.min_value = 0.0
+	_master_volume_slider.max_value = 1.0
+	_master_volume_slider.step = 0.01
+	_master_volume_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_master_volume_slider.value = 0.72
+	_master_volume_slider.value_changed.connect(_on_master_volume_slider_changed)
+	volume_row.add_child(_master_volume_slider)
+
+	var volume_plus: Button = Button.new()
+	volume_plus.text = "+"
+	volume_plus.custom_minimum_size = Vector2(28, 24)
+	volume_plus.pressed.connect(_on_master_volume_plus_pressed)
+	volume_row.add_child(volume_plus)
+
+	_master_mute_box = CheckBox.new()
+	_master_mute_box.text = "Mute"
+	_master_mute_box.toggled.connect(_on_master_mute_toggled)
+	volume_row.add_child(_master_mute_box)
+
+	_volume_value_label = Label.new()
+	_volume_value_label.text = "72%"
+	_volume_value_label.custom_minimum_size = Vector2(44, 0)
+	volume_row.add_child(_volume_value_label)
+
 	return panel
 
 func _build_home_screen() -> Control:
@@ -408,7 +652,7 @@ func _build_home_screen() -> Control:
 	col.add_child(hero)
 
 	var pitch: Label = Label.new()
-	pitch.text = "En 1-1 eliges una base sonora inicial; luego mejoras tu build para superar elites y bosses en X-3."
+	pitch.text = "Demo jugable: 1-1 base unica -> 1-2 decision -> 1-3 decision -> 1-4 miniboss."
 	pitch.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	pitch.modulate = Color(0.86, 0.92, 1.0)
 	col.add_child(pitch)
@@ -417,9 +661,9 @@ func _build_home_screen() -> Control:
 	pillars.add_theme_constant_override("h_separation", 8)
 	pillars.add_theme_constant_override("v_separation", 8)
 	col.add_child(pillars)
-	pillars.add_child(_feature_card("RUN MAP", "Elige nodo por piso"))
+	pillars.add_child(_feature_card("RUN MAP", "Ruta corta con riesgo/recompensa"))
 	pillars.add_child(_feature_card("CARD DRAFT", "Build unico por run"))
-	pillars.add_child(_feature_card("BOSS CHECK", "Requisitos musicales"))
+	pillars.add_child(_feature_card("MINIBOSS CHECK", "Objetivos musicales por acto"))
 
 	var actions: HFlowContainer = HFlowContainer.new()
 	actions.add_theme_constant_override("h_separation", 6)
@@ -473,23 +717,52 @@ func _build_run_screen() -> Control:
 	_run_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_run_status_label)
 
-	var pick_row: HBoxContainer = HBoxContainer.new()
-	pick_row.add_theme_constant_override("separation", 6)
-	col.add_child(pick_row)
+	_run_base_label = Label.new()
+	_run_base_label.text = "Base activa: ninguna"
+	_run_base_label.modulate = Color(0.86, 0.93, 0.98)
+	col.add_child(_run_base_label)
 
 	var pick_label: Label = Label.new()
-	pick_label.text = "Opciones de nodo"
-	pick_row.add_child(pick_label)
+	pick_label.text = "Elige carta / nodo"
+	pick_label.modulate = Color(0.95, 0.90, 0.78)
+	col.add_child(pick_label)
 
-	_run_choice_selector = OptionButton.new()
-	_run_choice_selector.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_run_choice_selector.item_selected.connect(_on_run_choice_item_selected)
-	pick_row.add_child(_run_choice_selector)
+	_run_choice_cards = HFlowContainer.new()
+	_run_choice_cards.add_theme_constant_override("h_separation", 8)
+	_run_choice_cards.add_theme_constant_override("v_separation", 8)
+	col.add_child(_run_choice_cards)
 
 	_run_node_label = Label.new()
 	_run_node_label.text = "Nodo seleccionado: -"
 	_run_node_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_run_node_label)
+
+	_run_combat_hint_label = Label.new()
+	_run_combat_hint_label.text = "Pelea: selecciona una carta para ver requisitos."
+	_run_combat_hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_run_combat_hint_label.modulate = Color(0.90, 0.95, 0.80)
+	col.add_child(_run_combat_hint_label)
+
+	_enemy_placeholder_panel = PanelContainer.new()
+	_enemy_placeholder_panel.visible = false
+	_enemy_placeholder_panel.add_theme_stylebox_override("panel", _panel_style(Color(0.14, 0.11, 0.11, 0.94), Color(0.75, 0.38, 0.38)))
+	col.add_child(_enemy_placeholder_panel)
+
+	var enemy_box: VBoxContainer = VBoxContainer.new()
+	enemy_box.add_theme_constant_override("separation", 4)
+	_enemy_placeholder_panel.add_child(enemy_box)
+
+	_enemy_face_label = Label.new()
+	_enemy_face_label.text = "( o_o )\nEnemy"
+	_enemy_face_label.add_theme_font_size_override("font_size", 26)
+	_enemy_face_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	enemy_box.add_child(_enemy_face_label)
+
+	_enemy_objective_label = Label.new()
+	_enemy_objective_label.text = "Objetivo:"
+	_enemy_objective_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_enemy_objective_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	enemy_box.add_child(_enemy_objective_label)
 
 	_reward_row = HFlowContainer.new()
 	_reward_row.add_theme_constant_override("h_separation", 6)
@@ -590,6 +863,31 @@ func _build_studio_screen() -> Control:
 	_auto_variation_check.toggled.connect(_on_auto_variation_toggled)
 	bpm_row.add_child(_auto_variation_check)
 
+	var rhythm_label: Label = Label.new()
+	rhythm_label.text = "Rhythm Presets"
+	rhythm_label.modulate = Color(0.95, 0.90, 0.78)
+	col.add_child(rhythm_label)
+
+	var rhythm_row: HFlowContainer = HFlowContainer.new()
+	rhythm_row.add_theme_constant_override("h_separation", 6)
+	rhythm_row.add_theme_constant_override("v_separation", 6)
+	col.add_child(rhythm_row)
+
+	var preset_straight: Button = Button.new()
+	preset_straight.text = "Straight"
+	preset_straight.pressed.connect(_on_rhythm_preset_button_pressed.bind("straight"))
+	rhythm_row.add_child(preset_straight)
+
+	var preset_half_time: Button = Button.new()
+	preset_half_time.text = "Half-time"
+	preset_half_time.pressed.connect(_on_rhythm_preset_button_pressed.bind("half_time"))
+	rhythm_row.add_child(preset_half_time)
+
+	var preset_sync: Button = Button.new()
+	preset_sync.text = "Syncopated"
+	preset_sync.pressed.connect(_on_rhythm_preset_button_pressed.bind("syncopated"))
+	rhythm_row.add_child(preset_sync)
+
 	col.add_child(_separator_label("Layers"))
 	_layer_rows = VBoxContainer.new()
 	_layer_rows.add_theme_constant_override("separation", 4)
@@ -677,6 +975,8 @@ func _create_nav_button(label: String, screen_id: String) -> Button:
 func _switch_screen(screen_id: String) -> void:
 	if not _screens.has(screen_id):
 		return
+	if screen_id == SCREEN_STUDIO and not _studio_unlocked:
+		screen_id = SCREEN_RUN
 	_current_screen = screen_id
 	for key in _screens.keys():
 		(_screens[key] as Control).visible = key == screen_id
@@ -826,6 +1126,9 @@ func _set_interaction(text: String) -> void:
 	_interaction_label.text = "Interaccion: %s" % text
 
 func _on_nav_pressed(screen_id: String) -> void:
+	if screen_id == SCREEN_STUDIO and not _studio_unlocked:
+		_set_interaction("Studio bloqueado: elige base primero")
+		return
 	_set_interaction("go %s" % screen_id)
 	_switch_screen(screen_id)
 
@@ -874,11 +1177,24 @@ func _on_run_new_button_pressed() -> void:
 	emit_signal("run_new_requested")
 	_switch_screen(SCREEN_RUN)
 
-func _on_run_choice_item_selected(index: int) -> void:
-	if _suppress_run_choice_events:
+func _on_run_choice_card_pressed(index: int) -> void:
+	if index < 0 or index >= _current_run_choices.size():
 		return
-	_set_interaction("Run choice %d" % (index + 1))
+	_set_interaction("Carta %d seleccionada" % (index + 1))
 	emit_signal("run_choice_selected", index)
+	emit_signal("run_enter_requested")
+
+func _on_run_choice_card_hovered(index: int) -> void:
+	if index < 0 or index >= _current_run_choices.size():
+		return
+	var item: Dictionary = _current_run_choices[index]
+	if String(item.get("type", "")) != "base_seed":
+		return
+	var profile_id: String = String(item.get("base_profile_id", ""))
+	if profile_id.is_empty():
+		return
+	_set_interaction("Preview base %s" % _pretty_base_name(profile_id))
+	emit_signal("base_card_hovered", profile_id)
 
 func _on_run_enter_button_pressed() -> void:
 	_set_interaction("Enter Node")
@@ -919,3 +1235,36 @@ func _on_auto_test_button_pressed() -> void:
 func _on_manual_variation_button_pressed() -> void:
 	_set_interaction("Apply Variation")
 	emit_signal("manual_variation_requested")
+
+func _on_rhythm_preset_button_pressed(preset_id: String) -> void:
+	_set_interaction("Rhythm preset %s" % preset_id)
+	emit_signal("rhythm_preset_requested", preset_id)
+
+func _on_master_volume_slider_changed(value: float) -> void:
+	if _suppress_volume_events:
+		return
+	var clamped_value: float = clamp(value, 0.0, 1.0)
+	if _volume_value_label != null:
+		_volume_value_label.text = "%d%%" % int(round(clamped_value * 100.0))
+	_set_interaction("Volumen %d%%" % int(round(clamped_value * 100.0)))
+	emit_signal("master_volume_changed", clamped_value)
+
+func _on_master_volume_minus_pressed() -> void:
+	var next_value: float = clamp((_master_volume_slider.value if _master_volume_slider != null else 0.72) - 0.10, 0.0, 1.0)
+	if _master_volume_slider != null:
+		_master_volume_slider.value = next_value
+	else:
+		_on_master_volume_slider_changed(next_value)
+
+func _on_master_volume_plus_pressed() -> void:
+	var next_value: float = clamp((_master_volume_slider.value if _master_volume_slider != null else 0.72) + 0.10, 0.0, 1.0)
+	if _master_volume_slider != null:
+		_master_volume_slider.value = next_value
+	else:
+		_on_master_volume_slider_changed(next_value)
+
+func _on_master_mute_toggled(muted: bool) -> void:
+	if _suppress_volume_events:
+		return
+	_set_interaction("Mute %s" % ("ON" if muted else "OFF"))
+	emit_signal("master_mute_toggled", muted)

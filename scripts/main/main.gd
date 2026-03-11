@@ -5,7 +5,7 @@ class_name Main
 const STEPS_PER_LOOP = 16
 const DEFAULT_RUN_BPM: int = 116
 const CARD_LIBRARY_SCRIPT = preload("res://scripts/core/card_library.gd")
-@export var auto_start_on_play: bool = true
+@export var auto_start_on_play: bool = false
 
 @onready var clock: MusicClock = $MusicClock
 @onready var sequencer: Sequencer = $Sequencer
@@ -39,6 +39,11 @@ var _active_cards: Array = []
 var _pending_card_draft: Array = []
 var _temp_score_bonus: int = 0
 var _base_active_hand_size: int = 3
+var _preview_tween: Tween
+var _master_volume_linear: float = 0.72
+var _master_muted: bool = false
+var _decision_ducking_enabled: bool = true
+var _decision_duck_factor: float = 0.55
 
 func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
@@ -50,6 +55,7 @@ func _ready() -> void:
 	_configure_sequencer()
 	_connect_signals()
 	_configure_ui()
+	_apply_master_volume()
 	sequencer.rebuild_now(0)
 	_refresh_metrics()
 	ui.update_clock_display(clock.current_step, clock.loop_index, clock.bpm, clock.running)
@@ -77,6 +83,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				var bosses = battle_system.get_boss_ids()
 				if not bosses.is_empty():
 					_on_battle_requested(bosses[0])
+			KEY_MINUS, KEY_KP_SUBTRACT:
+				_on_master_volume_changed(_master_volume_linear - 0.1)
+			KEY_EQUAL, KEY_KP_ADD:
+				_on_master_volume_changed(_master_volume_linear + 0.1)
+			KEY_M:
+				_on_master_mute_toggled(not _master_muted)
 
 func _configure_layers() -> void:
 	_layers = {
@@ -172,6 +184,10 @@ func _connect_signals() -> void:
 	ui.run_reward_selected.connect(_on_run_reward_selected)
 	ui.card_play_requested.connect(_on_card_play_requested)
 	ui.card_draft_pick_requested.connect(_on_card_draft_pick_requested)
+	ui.base_card_hovered.connect(_on_base_card_hovered)
+	ui.rhythm_preset_requested.connect(_on_rhythm_preset_requested)
+	ui.master_volume_changed.connect(_on_master_volume_changed)
+	ui.master_mute_toggled.connect(_on_master_mute_toggled)
 
 func _configure_ui() -> void:
 	ui.configure(
@@ -183,6 +199,8 @@ func _configure_ui() -> void:
 		STEPS_PER_LOOP,
 		clock.bpm
 	)
+	ui.set_studio_unlocked(false)
+	ui.set_master_volume(_master_volume_linear, _master_muted)
 	ui.set_track_pattern(_selected_track, sequencer.get_pattern(_selected_track))
 
 func _on_clock_step_advanced(step_index: int, loop_index: int) -> void:
@@ -207,6 +225,13 @@ func _on_upgrades_changed() -> void:
 	_refresh_metrics()
 
 func _on_start_requested() -> void:
+	var run_state: Dictionary = run_manager.get_state()
+	if not bool(run_state.get("active", false)):
+		ui.update_variation_display("Pulsa New Run para comenzar una fase.")
+		return
+	if String(run_state.get("base_profile_id", "")).is_empty():
+		ui.update_variation_display("Elige una carta base en RUN antes de iniciar el loop.")
+		return
 	clock.start_clock()
 	ui.update_variation_display("Main: Start")
 	ui.update_clock_display(clock.current_step, clock.loop_index, clock.bpm, clock.running)
@@ -293,7 +318,7 @@ func _on_manual_variation_requested() -> void:
 
 func _on_run_new_requested() -> void:
 	run_manager.start_new_run()
-	ui.update_variation_display("Run iniciada: elige base en 1-1")
+	ui.update_variation_display("Run iniciada: 1-1 base, 1-2 decision, 1-3 decision, 1-4 miniboss.")
 
 func _on_run_choice_selected(index: int) -> void:
 	run_manager.select_choice(index)
@@ -318,6 +343,9 @@ func _on_run_reward_selected(index: int) -> void:
 
 func _on_run_started(_state: Dictionary) -> void:
 	_card_library.set_seed(int(_state.get("seed", 0)))
+	clock.stop_clock()
+	clock.reset()
+	ui.update_clock_display(clock.current_step, clock.loop_index, clock.bpm, clock.running)
 	_reset_cards()
 	_reset_musical_build_for_run()
 	_sync_run_ui()
@@ -329,6 +357,8 @@ func _on_run_reward_offered(_rewards: Array) -> void:
 	_sync_run_ui()
 
 func _on_run_ended(victory: bool, reason: String) -> void:
+	clock.stop_clock()
+	ui.update_clock_display(clock.current_step, clock.loop_index, clock.bpm, clock.running)
 	ui.update_battle_display({
 		"boss_name": "Run",
 		"victory": victory,
@@ -363,7 +393,11 @@ func _handle_run_action(action: Dictionary) -> void:
 		"battle":
 			_resolve_run_battle(action.get("node", {}))
 		"base_choice":
+			if _preview_tween != null and _preview_tween.is_running():
+				_preview_tween.kill()
 			_apply_base_profile(String(action.get("base_profile_id", "")))
+			clock.start_clock(true)
+			ui.update_clock_display(clock.current_step, clock.loop_index, clock.bpm, clock.running)
 			ui.update_battle_display({
 				"boss_name": "Base",
 				"victory": true,
@@ -386,28 +420,20 @@ func _handle_run_action(action: Dictionary) -> void:
 
 func _resolve_run_battle(node: Dictionary) -> void:
 	_refresh_metrics()
-	var boss_id: String = String(node.get("boss_id", "groove_test"))
 	var node_type: String = String(node.get("type", "combat"))
-	var battle_result: Dictionary = battle_system.evaluate_battle(
-		boss_id,
-		_current_metrics,
-		sequencer.get_active_effective_patterns(),
-		upgrade_system.get_enabled_map()
-	)
-
-	var required_score: int = int(node.get("required_score", 0))
 	var score_now: int = int(_current_metrics.get("score", 0))
-	var card_score_bonus: int = _compute_card_score_bonus(node_type == "boss")
+	var is_boss_like: bool = node_type == "boss" or node_type == "miniboss"
+	var card_score_bonus: int = _compute_card_score_bonus(is_boss_like)
 	var score_with_cards: int = score_now + card_score_bonus
-	var victory: bool = bool(battle_result.get("victory", false)) and score_with_cards >= required_score
+	var battle_result: Dictionary = _evaluate_run_enemy(node, score_with_cards)
+	var victory: bool = bool(battle_result.get("victory", false))
 	var reason: String = String(battle_result.get("reason", ""))
 	if card_score_bonus > 0:
 		reason += " | Bonus cartas +%d" % card_score_bonus
-	if score_with_cards < required_score:
-		reason += " | Score insuficiente %d/%d" % [score_with_cards, required_score]
+	var battle_label: String = String(node.get("label", String(battle_result.get("boss_name", "Enemy"))))
 
 	ui.update_battle_display({
-		"boss_name": String(node.get("label", boss_id)),
+		"boss_name": battle_label,
 		"victory": victory,
 		"battle_score": int(battle_result.get("battle_score", 0)),
 		"reason": reason,
@@ -421,6 +447,101 @@ func _resolve_run_battle(node: Dictionary) -> void:
 		reason
 	)
 	_temp_score_bonus = 0
+
+func _evaluate_run_enemy(node: Dictionary, effective_score: int) -> Dictionary:
+	var node_type: String = String(node.get("type", "combat"))
+	var required_score: int = int(node.get("required_score", 0))
+	var score_ok: bool = effective_score >= required_score
+	var boss_name: String = String(node.get("enemy_name", node.get("label", "Enemy")))
+
+	match node_type:
+		"first_enemy":
+			var track_name: String = String(node.get("goal_track", node.get("required_track", "kick")))
+			var track_label: String = String(node.get("required_track_label", track_name.capitalize()))
+			var min_hits: int = int(node.get("goal_min_hits", node.get("min_hits", 6)))
+			var hits: int = _count_track_hits(track_name)
+			var hits_ok: bool = hits >= min_hits
+			var victory_first: bool = score_ok and hits_ok
+			var reason_first: String = "Checklist: Hits %d/%d en %s | Score %d/%d." % [
+				hits, min_hits, track_label, effective_score, required_score
+			]
+			return {
+				"boss_name": boss_name,
+				"victory": victory_first,
+				"battle_score": effective_score + hits * 5,
+				"reason": reason_first,
+			}
+		"combat":
+			var reason_combat: String = "Checklist: Score %d/%d." % [effective_score, required_score]
+			return {
+				"boss_name": boss_name,
+				"victory": score_ok,
+				"battle_score": effective_score,
+				"reason": reason_combat,
+			}
+		"elite":
+			var min_sync: float = float(node.get("goal_min_syncopation", 0.18))
+			var sync_now: float = float(_current_metrics.get("syncopation", 0.0))
+			var sync_ok: bool = sync_now >= min_sync
+			var victory_elite: bool = score_ok and sync_ok
+			var reason_elite: String = "Checklist: Score %d/%d | Sync %.2f/%.2f." % [
+				effective_score, required_score, sync_now, min_sync
+			]
+			return {
+				"boss_name": boss_name,
+				"victory": victory_elite,
+				"battle_score": effective_score + int(round(sync_now * 100.0)),
+				"reason": reason_elite,
+			}
+		"miniboss":
+			var min_sync_mb: float = float(node.get("goal_min_syncopation", 0.22))
+			var min_groove_mb: float = float(node.get("goal_min_groove", 0.45))
+			var sync_mb: float = float(_current_metrics.get("syncopation", 0.0))
+			var groove_mb: float = float(_current_metrics.get("groove", 0.0))
+			var sync_mb_ok: bool = sync_mb >= min_sync_mb
+			var groove_mb_ok: bool = groove_mb >= min_groove_mb
+			var victory_mb: bool = score_ok and sync_mb_ok and groove_mb_ok
+			var reason_mb: String = "Checklist: Score %d/%d | Sync %.2f/%.2f | Groove %.2f/%.2f." % [
+				effective_score, required_score, sync_mb, min_sync_mb, groove_mb, min_groove_mb
+			]
+			return {
+				"boss_name": boss_name,
+				"victory": victory_mb,
+				"battle_score": effective_score + int(round(sync_mb * 100.0)) + int(round(groove_mb * 100.0)),
+				"reason": reason_mb,
+			}
+		_:
+			var boss_id: String = String(node.get("boss_id", "groove_test"))
+			var fallback_result: Dictionary = battle_system.evaluate_battle(
+				boss_id,
+				_current_metrics,
+				sequencer.get_active_effective_patterns(),
+				upgrade_system.get_enabled_map()
+			)
+			var fallback_win: bool = bool(fallback_result.get("victory", false)) and score_ok
+			var fallback_reason: String = "Checklist: Score %d/%d | Boss rule %s." % [
+				effective_score, required_score, "OK" if bool(fallback_result.get("victory", false)) else "FAIL"
+			]
+			return {
+				"boss_name": String(fallback_result.get("boss_name", boss_name)),
+				"victory": fallback_win,
+				"battle_score": int(fallback_result.get("battle_score", effective_score)),
+				"reason": fallback_reason,
+			}
+
+func _count_track_hits(track_name: String) -> int:
+	var patterns: Dictionary = sequencer.get_active_effective_patterns()
+	if not patterns.has(track_name):
+		return 0
+	var track_pattern: Variant = patterns[track_name]
+	if typeof(track_pattern) != TYPE_ARRAY:
+		return 0
+	var pattern_array: Array = track_pattern as Array
+	var hits: int = 0
+	for step_value in pattern_array:
+		if int(step_value) == 1:
+			hits += 1
+	return hits
 
 func _apply_external_reward(reward: Dictionary) -> void:
 	if reward.is_empty():
@@ -556,6 +677,7 @@ func _randomize_one_track() -> void:
 
 func _sync_run_ui() -> void:
 	var run_state: Dictionary = run_manager.get_state()
+	ui.set_studio_unlocked(not String(run_state.get("base_profile_id", "")).is_empty())
 	ui.update_run_status(run_state)
 	ui.update_run_choices(
 		run_state.get("current_choices", []),
@@ -566,7 +688,184 @@ func _sync_run_ui() -> void:
 		run_state.get("pending_rewards", []),
 		int(run_state.get("coins", 0))
 	)
+	ui.update_run_combat_hint(_build_run_combat_hint(run_state))
+	_update_focus_audio(run_state)
 	_sync_card_ui()
+
+func _build_run_combat_hint(run_state: Dictionary) -> String:
+	var pending_variant: Variant = run_state.get("pending_node", {})
+	if typeof(pending_variant) != TYPE_DICTIONARY:
+		return "Selecciona una carta para ver los requisitos de pelea."
+	var pending_node: Dictionary = pending_variant as Dictionary
+	if pending_node.is_empty():
+		return "Selecciona una carta para ver los requisitos de pelea."
+
+	var node_type: String = String(pending_node.get("type", ""))
+	if node_type == "base_seed":
+		return "Paso 1: elige una base. Luego se desbloquean peleas por checklist."
+	if not _is_run_battle_node(node_type):
+		return "Nodo de utilidad: no hay pelea en esta carta."
+
+	var score_now: int = int(_current_metrics.get("score", 0))
+	var is_boss_like: bool = node_type == "boss" or node_type == "miniboss"
+	var card_bonus: int = _compute_card_score_bonus(is_boss_like)
+	var effective_score: int = score_now + card_bonus
+	var preview: Dictionary = _evaluate_run_enemy(pending_node, effective_score)
+	var win_text: String = "GANAS" if bool(preview.get("victory", false)) else "PIERDES"
+	return "Si peleas ahora: %s | %s" % [win_text, String(preview.get("reason", ""))]
+
+func _is_run_battle_node(node_type: String) -> bool:
+	return node_type == "first_enemy" or node_type == "combat" or node_type == "elite" or node_type == "miniboss" or node_type == "boss"
+
+func _update_focus_audio(run_state: Dictionary) -> void:
+	var should_duck: bool = false
+	if _decision_ducking_enabled:
+		var has_base: bool = not String(run_state.get("base_profile_id", "")).is_empty()
+		var awaiting_reward: bool = bool(run_state.get("awaiting_reward", false))
+		should_duck = has_base and awaiting_reward
+	_apply_master_volume(_decision_duck_factor if should_duck else 1.0)
+
+func _on_base_card_hovered(profile_id: String) -> void:
+	if profile_id.is_empty():
+		return
+	_play_base_preview(profile_id)
+
+func _on_rhythm_preset_requested(preset_id: String) -> void:
+	_apply_rhythm_preset(preset_id)
+
+func _apply_rhythm_preset(preset_id: String) -> void:
+	var run_state: Dictionary = run_manager.get_state()
+	var base_profile_id: String = String(run_state.get("base_profile_id", ""))
+	if base_profile_id.is_empty():
+		ui.update_variation_display("Primero elige una base para aplicar ritmo.")
+		return
+	var target_track: String = _track_for_base_profile(base_profile_id)
+	if target_track.is_empty():
+		target_track = _selected_track
+
+	var rhythm_pattern: Array = []
+	match preset_id:
+		"straight":
+			rhythm_pattern = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+		"half_time":
+			rhythm_pattern = [1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0]
+		"syncopated":
+			rhythm_pattern = [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0]
+		_:
+			return
+
+	sequencer.set_pattern(target_track, rhythm_pattern)
+
+	sequencer.rebuild_now(clock.loop_index)
+	ui.set_track_pattern(_selected_track, sequencer.get_pattern(_selected_track))
+	_refresh_metrics()
+	ui.update_variation_display("Rhythm preset aplicado en %s: %s" % [target_track, preset_id])
+
+func _track_for_base_profile(profile_id: String) -> String:
+	match profile_id:
+		"drum_seed":
+			return "kick"
+		"trumpet_seed":
+			return "melody"
+		"bass_seed":
+			return "bass"
+		_:
+			return ""
+
+func _play_base_preview(profile_id: String) -> void:
+	var profiles: Dictionary = _base_profiles()
+	if not profiles.has(profile_id):
+		return
+	var profile_variant: Variant = profiles[profile_id]
+	if typeof(profile_variant) == TYPE_DICTIONARY:
+		var profile: Dictionary = profile_variant as Dictionary
+		var bass_seq: Variant = profile.get("bass_sequence", [])
+		if typeof(bass_seq) == TYPE_ARRAY:
+			_set_bass_freq_sequence(bass_seq as Array)
+		var melody_seq: Variant = profile.get("melody_sequence", [])
+		if typeof(melody_seq) == TYPE_ARRAY:
+			_set_melody_freq_sequence(melody_seq as Array)
+
+	if _preview_tween != null and _preview_tween.is_running():
+		_preview_tween.kill()
+
+	var events: Array = _base_preview_events(profile_id)
+	if events.is_empty():
+		return
+
+	_preview_tween = create_tween()
+	var timeline: float = 0.0
+	for event_value in events:
+		if typeof(event_value) != TYPE_DICTIONARY:
+			continue
+		var event_data: Dictionary = event_value
+		var t: float = float(event_data.get("t", 0.0))
+		var wait: float = max(0.0, t - timeline)
+		timeline = t
+		_preview_tween.tween_interval(wait)
+		_preview_tween.tween_callback(
+			Callable(self, "_trigger_preview_track").bind(
+				String(event_data.get("track", "kick")),
+				int(event_data.get("step", 0)),
+				float(event_data.get("velocity", 0.6))
+			)
+		)
+
+func _base_preview_events(profile_id: String) -> Array:
+	match profile_id:
+		"drum_seed":
+			return [
+				{"t": 0.00, "track": "kick", "step": 0, "velocity": 0.86},
+				{"t": 0.18, "track": "kick", "step": 4, "velocity": 0.86},
+				{"t": 0.36, "track": "kick", "step": 8, "velocity": 0.86},
+				{"t": 0.54, "track": "kick", "step": 12, "velocity": 0.86},
+			]
+		"trumpet_seed":
+			return [
+				{"t": 0.00, "track": "melody", "step": 0, "velocity": 0.52},
+				{"t": 0.16, "track": "melody", "step": 5, "velocity": 0.52},
+				{"t": 0.32, "track": "melody", "step": 8, "velocity": 0.52},
+				{"t": 0.48, "track": "melody", "step": 13, "velocity": 0.52},
+			]
+		"bass_seed":
+			return [
+				{"t": 0.00, "track": "bass", "step": 0, "velocity": 0.62},
+				{"t": 0.18, "track": "bass", "step": 4, "velocity": 0.62},
+				{"t": 0.36, "track": "bass", "step": 8, "velocity": 0.62},
+				{"t": 0.54, "track": "bass", "step": 12, "velocity": 0.62},
+			]
+		_:
+			return []
+
+func _trigger_preview_track(track_name: String, step_index: int, velocity: float) -> void:
+	var layer_id: String = String(_track_to_layer.get(track_name, ""))
+	if layer_id.is_empty() or not _layers.has(layer_id):
+		return
+	var layer: InstrumentLayer = _layers[layer_id]
+	layer.trigger_track(track_name, step_index, velocity)
+
+func _on_master_volume_changed(volume_linear: float) -> void:
+	_master_volume_linear = clamp(volume_linear, 0.0, 1.0)
+	if _master_muted and _master_volume_linear > 0.0:
+		_master_muted = false
+	ui.set_master_volume(_master_volume_linear, _master_muted)
+	_apply_master_volume()
+
+func _on_master_mute_toggled(muted: bool) -> void:
+	_master_muted = muted
+	ui.set_master_volume(_master_volume_linear, _master_muted)
+	_apply_master_volume()
+
+func _apply_master_volume(extra_gain: float = 1.0) -> void:
+	var bus_index: int = AudioServer.get_bus_index("Master")
+	if bus_index < 0:
+		return
+	if _master_muted:
+		AudioServer.set_bus_mute(bus_index, true)
+		return
+	AudioServer.set_bus_mute(bus_index, false)
+	var linear_value: float = clamp(_master_volume_linear * extra_gain, 0.0001, 1.0)
+	AudioServer.set_bus_volume_db(bus_index, linear_to_db(linear_value))
 
 func _reset_musical_build_for_run() -> void:
 	# Each run starts from a clean musical state before selecting 1-1 base.
@@ -601,22 +900,43 @@ func _apply_base_profile(profile_id: String) -> void:
 	if typeof(profile_value) != TYPE_DICTIONARY:
 		ui.update_variation_display("Base invalida: %s" % profile_id)
 		return
-	var profile: Dictionary = profile_value
+	var profile: Dictionary = profile_value as Dictionary
 
 	var patterns_value: Variant = profile.get("patterns", {})
 	if typeof(patterns_value) == TYPE_DICTIONARY:
-		sequencer.load_base_patterns(patterns_value, true)
+		var base_patterns: Dictionary = patterns_value as Dictionary
+		sequencer.load_base_patterns(base_patterns, true)
+
+	var primary_track: String = String(profile.get("primary_track", _selected_track))
+	if not primary_track.is_empty():
+		_selected_track = primary_track
+		ui.select_track(_selected_track)
 
 	var bpm_value: Variant = profile.get("bpm", DEFAULT_RUN_BPM)
 	clock.set_bpm(int(bpm_value))
 
 	var bass_seq_value: Variant = profile.get("bass_sequence", [])
 	if typeof(bass_seq_value) == TYPE_ARRAY:
-		_set_bass_freq_sequence(bass_seq_value)
+		var bass_seq: Array = bass_seq_value as Array
+		_set_bass_freq_sequence(bass_seq)
 
 	var melody_seq_value: Variant = profile.get("melody_sequence", [])
 	if typeof(melody_seq_value) == TYPE_ARRAY:
-		_set_melody_freq_sequence(melody_seq_value)
+		var melody_seq: Array = melody_seq_value as Array
+		_set_melody_freq_sequence(melody_seq)
+
+	var active_layers_value: Variant = profile.get("active_layers", [])
+	if typeof(active_layers_value) == TYPE_ARRAY:
+		var active_layers_raw: Array = active_layers_value as Array
+		var active_layer_ids: Array[String] = []
+		for layer_variant in active_layers_raw:
+			active_layer_ids.append(String(layer_variant))
+		for layer_id in _layers.keys():
+			var layer: InstrumentLayer = _layers[layer_id]
+			var enabled: bool = active_layer_ids.has(layer_id)
+			layer.set_active(enabled)
+			layer.set_muted(false)
+			ui.set_layer_state(layer_id, enabled, false)
 
 	var starter_map: Dictionary = {}
 	for upgrade_id in upgrade_system.get_upgrade_ids():
@@ -641,53 +961,59 @@ func _apply_base_profile(profile_id: String) -> void:
 
 func _base_profiles() -> Dictionary:
 	return {
-		"pulse_foundry": {
-			"label": "Pulse Foundry",
-			"summary": "Kick directo, bajo estable y groove solido.",
-			"bpm": 114,
+		"drum_seed": {
+			"label": "Drum Pulse",
+			"summary": "Solo kick basico para arrancar.",
+			"primary_track": "kick",
+			"active_layers": ["drums"],
+			"bpm": 108,
 			"patterns": {
-				"kick": [1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1],
-				"snare": [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-				"hat": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-				"bass": [1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1],
-				"melody": [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-				"fx": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+				"kick": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+				"snare": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"hat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"bass": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"melody": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"fx": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 			},
-			"bass_sequence": [55.0, 55.0, 55.0, 65.4, 73.4, 65.4, 55.0, 49.0, 55.0, 55.0, 65.4, 73.4, 65.4, 55.0, 49.0, 55.0],
-			"melody_sequence": [220.0, 220.0, 247.0, 262.0, 294.0, 294.0, 262.0, 247.0, 220.0, 247.0, 262.0, 294.0, 330.0, 294.0, 262.0, 247.0],
+			"bass_sequence": _default_bass_sequence(),
+			"melody_sequence": _default_melody_sequence(),
 			"starter_upgrades": [],
 		},
-		"sync_weave": {
-			"label": "Sync Weave",
-			"summary": "Mas sincopa, hats densos y rebote melodico.",
-			"bpm": 124,
+		"trumpet_seed": {
+			"label": "Brass Call",
+			"summary": "Solo linea de trompeta sintetica.",
+			"primary_track": "melody",
+			"active_layers": ["melody"],
+			"bpm": 102,
 			"patterns": {
-				"kick": [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0],
-				"snare": [0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1],
-				"hat": [1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0],
-				"bass": [1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1],
-				"melody": [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0],
-				"fx": [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
-			},
-			"bass_sequence": [55.0, 65.4, 55.0, 73.4, 82.4, 73.4, 65.4, 55.0, 49.0, 55.0, 65.4, 73.4, 82.4, 73.4, 65.4, 55.0],
-			"melody_sequence": [247.0, 262.0, 294.0, 330.0, 294.0, 330.0, 349.0, 392.0, 330.0, 349.0, 392.0, 440.0, 392.0, 349.0, 330.0, 294.0],
-			"starter_upgrades": ["swing_mode"],
-		},
-		"neon_mist": {
-			"label": "Neon Mist",
-			"summary": "Menos densidad, aire melodico y foco en textura.",
-			"bpm": 106,
-			"patterns": {
-				"kick": [1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0],
-				"snare": [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-				"hat": [1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0],
-				"bass": [1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0],
+				"kick": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"snare": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"hat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"bass": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 				"melody": [1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-				"fx": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0],
+				"fx": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 			},
-			"bass_sequence": [49.0, 49.0, 55.0, 49.0, 43.6, 49.0, 55.0, 49.0, 43.6, 49.0, 55.0, 58.2, 55.0, 49.0, 43.6, 49.0],
-			"melody_sequence": [196.0, 220.0, 247.0, 262.0, 294.0, 262.0, 247.0, 220.0, 196.0, 220.0, 247.0, 294.0, 330.0, 294.0, 247.0, 220.0],
-			"starter_upgrades": ["echo_melody"],
+			"bass_sequence": _default_bass_sequence(),
+			"melody_sequence": [330.0, 330.0, 370.0, 392.0, 440.0, 392.0, 370.0, 330.0, 294.0, 330.0, 370.0, 392.0, 440.0, 392.0, 370.0, 330.0],
+			"starter_upgrades": [],
+		},
+		"bass_seed": {
+			"label": "Bass March",
+			"summary": "Solo bajo en pulso simple.",
+			"primary_track": "bass",
+			"active_layers": ["bass"],
+			"bpm": 100,
+			"patterns": {
+				"kick": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"snare": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"hat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"bass": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+				"melody": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				"fx": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+			},
+			"bass_sequence": [49.0, 49.0, 49.0, 55.0, 43.6, 43.6, 49.0, 55.0, 49.0, 49.0, 55.0, 58.2, 49.0, 49.0, 43.6, 49.0],
+			"melody_sequence": _default_melody_sequence(),
+			"starter_upgrades": [],
 		},
 	}
 
@@ -718,6 +1044,9 @@ func _refresh_metrics() -> void:
 		upgrade_system.get_enabled_map()
 	)
 	ui.update_score_display(_current_metrics)
+	var run_state: Dictionary = run_manager.get_state()
+	if bool(run_state.get("active", false)):
+		ui.update_run_combat_hint(_build_run_combat_hint(run_state))
 
 func _apply_random_build() -> void:
 	var state = _random_build_state()
