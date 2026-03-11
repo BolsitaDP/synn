@@ -1,0 +1,76 @@
+[gd_scene load_steps=10 format=3]
+
+[ext_resource type="Script" path="res://scripts/main/main.gd" id="1"]
+[ext_resource type="Script" path="res://scripts/core/music_clock.gd" id="2"]
+[ext_resource type="Script" path="res://scripts/core/sequencer.gd" id="3"]
+[ext_resource type="Script" path="res://scripts/core/upgrade_system.gd" id="4"]
+[ext_resource type="Script" path="res://scripts/core/score_analyzer.gd" id="5"]
+[ext_resource type="Script" path="res://scripts/core/battle_system.gd" id="6"]
+[ext_resource type="Script" path="res://scripts/core/instrument_layer.gd" id="7"]
+[ext_resource type="Script" path="res://scripts/ui/ui_controller.gd" id="8"]
+[ext_resource type="Script" path="res://scripts/core/run_manager.gd" id="9"]
+
+[node name="Main" type="Node"]
+script = ExtResource("1")
+
+[node name="MusicClock" type="Node" parent="."]
+script = ExtResource("2")
+bpm = 116
+steps_per_loop = 16
+
+[node name="Sequencer" type="Node" parent="."]
+script = ExtResource("3")
+steps_per_loop = 16
+
+[node name="UpgradeSystem" type="Node" parent="."]
+script = ExtResource("4")
+
+[node name="ScoreAnalyzer" type="Node" parent="."]
+script = ExtResource("5")
+
+[node name="BattleSystem" type="Node" parent="."]
+script = ExtResource("6")
+
+[node name="RunManager" type="Node" parent="."]
+script = ExtResource("9")
+
+[node name="Layers" type="Node" parent="."]
+
+[node name="DrumsLayer" type="Node" parent="Layers"]
+script = ExtResource("7")
+layer_id = "drums"
+display_name = "Drums"
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="Layers/DrumsLayer"]
+
+[node name="BassLayer" type="Node" parent="Layers"]
+script = ExtResource("7")
+layer_id = "bass"
+display_name = "Bass"
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="Layers/BassLayer"]
+
+[node name="MelodyLayer" type="Node" parent="Layers"]
+script = ExtResource("7")
+layer_id = "melody"
+display_name = "Melody"
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="Layers/MelodyLayer"]
+
+[node name="FxLayer" type="Node" parent="Layers"]
+script = ExtResource("7")
+layer_id = "fx"
+display_name = "FX"
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="Layers/FxLayer"]
+
+[node name="CanvasLayer" type="CanvasLayer" parent="."]
+
+[node name="UIRoot" type="Control" parent="CanvasLayer"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("8")
